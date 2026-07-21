@@ -37,33 +37,68 @@ def load_model():
     return model, calibrator, feature_columns
 
 
-def fetch_recent_data(limit=1500):
+# Tried in order -- some cloud hosts (e.g. Railway's default US region) get a
+# 451 "restricted location" response from Binance's main site, since Binance
+# blocks connections from US-based servers by policy. Falling back to other
+# exchanges keeps the app working regardless of where it's hosted.
+EXCHANGE_FALLBACK_ORDER = [
+    ("binance", "BTC/USDT"),
+    ("coinbase", "BTC/USD"),
+    ("kraken", "BTC/USD"),
+]
+
+
+def _try_exchanges(action):
+    """Tries each exchange in EXCHANGE_FALLBACK_ORDER, returning the first
+    successful result of action(exchange, symbol). Raises the last error
+    if all of them fail."""
     import ccxt
 
-    exchange = ccxt.binance({"enableRateLimit": True})
-    ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe="1m", limit=limit)
-    if not ohlcv:
-        raise RuntimeError("No data returned from Binance -- try again in a moment.")
+    last_error = None
+    for exchange_id, symbol in EXCHANGE_FALLBACK_ORDER:
+        try:
+            exchange_cls = getattr(ccxt, exchange_id)
+            exchange = exchange_cls({"enableRateLimit": True})
+            return action(exchange, symbol), exchange_id
+        except Exception as e:
+            last_error = e
+            continue
+    raise RuntimeError(
+        f"Could not reach any exchange (tried {[e for e, _ in EXCHANGE_FALLBACK_ORDER]}). "
+        f"Last error: {last_error}"
+    )
+
+
+def fetch_recent_data(limit=1500):
+    def action(exchange, symbol):
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1m", limit=limit)
+        if not ohlcv:
+            raise RuntimeError("No data returned.")
+        return ohlcv
+
+    ohlcv, exchange_used = _try_exchanges(action)
 
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.attrs["exchange_used"] = exchange_used
     return df
 
 
 def fetch_order_book_signal():
     """Live-only, NOT part of the validated/backtested model (see predict_now.py notes)."""
-    try:
-        import ccxt
-
-        exchange = ccxt.binance({"enableRateLimit": True})
-        book = exchange.fetch_order_book("BTC/USDT", limit=50)
+    def action(exchange, symbol):
+        book = exchange.fetch_order_book(symbol, limit=50)
         bid_volume = sum(qty for _, qty in book["bids"])
         ask_volume = sum(qty for _, qty in book["asks"])
         total = bid_volume + ask_volume
         if total == 0:
-            return None
+            raise RuntimeError("Empty order book.")
         imbalance = (bid_volume - ask_volume) / total
         return {"bid_volume": bid_volume, "ask_volume": ask_volume, "imbalance": imbalance}
+
+    try:
+        result, _ = _try_exchanges(action)
+        return result
     except Exception:
         return None
 
