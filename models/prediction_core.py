@@ -22,6 +22,15 @@ from indicators import add_baseline_features  # noqa: E402
 ARTIFACTS_DIR = os.path.join(os.path.dirname(__file__), "artifacts")
 
 
+# -- NEW: Volatility regime thresholds from Phase 2/3 analysis --
+# If vol_zscore_20 exceeds this, the model's edge is unproven.
+# These are placeholders -- update with your actual Phase 2 quartile cutoffs.
+VOLATILITY_REGIME_THRESHOLDS = {
+    "high_vol_cutoff": 1.0,      # vol_zscore_20 > 1.0 = elevated regime
+    "extreme_vol_cutoff": 2.0,   # vol_zscore_20 > 2.0 = model untested
+}
+
+
 def load_model():
     model_path = os.path.join(ARTIFACTS_DIR, "model.pkl")
     if not os.path.exists(model_path):
@@ -154,6 +163,21 @@ def get_current_prediction():
 
     ob_signal = fetch_order_book_signal()
 
+    # -- NEW: Volatility regime check --
+    vol_z = float(latest.get("vol_zscore_20", float("nan")))
+    regime_warning = None
+    if not np.isnan(vol_z):
+        if vol_z > VOLATILITY_REGIME_THRESHOLDS["extreme_vol_cutoff"]:
+            regime_warning = (
+                f"EXTREME volatility detected (vol_zscore={vol_z:.2f}). "
+                f"The model was NOT tested in this regime. Prediction is unreliable."
+            )
+        elif vol_z > VOLATILITY_REGIME_THRESHOLDS["high_vol_cutoff"]:
+            regime_warning = (
+                f"Elevated volatility detected (vol_zscore={vol_z:.2f}). "
+                f"Model edge is weaker here per Phase 2/3. Treat with caution."
+            )
+
     return {
         "timestamp": latest["timestamp"].isoformat(),
         "price": float(latest["close"]),
@@ -163,8 +187,9 @@ def get_current_prediction():
         "ema_dist": float(latest.get("ema_dist", float("nan"))),
         "ret_5": float(latest.get("ret_5", float("nan"))),
         "ret_15": float(latest.get("ret_15", float("nan"))),
-        "vol_z": float(latest.get("vol_zscore_20", float("nan"))),
+        "vol_z": vol_z,
         "order_book": ob_signal,
+        "regime_warning": regime_warning,
     }
 
 
@@ -195,12 +220,31 @@ def analyze_price_target(target_price: float, target_time_str: str):
     if sigma_per_minute == 0 or np.isnan(sigma_per_minute):
         raise RuntimeError("Could not estimate volatility from recent data -- try again.")
 
+    # -- FIX: Time-decay drift + volatility regime adjustment --
+    # The model's 15-min signal decays as we extrapolate further.
+    # We apply a time-decay factor: signal strength halves every 15 minutes.
+    # Also scale up volatility estimate in elevated regimes.
+    time_decay_factor = max(0.3, math.exp(-0.046 * minutes_ahead / 15))
+    # ^ decay factor: 1.0 at 0 min, ~0.63 at 15 min, ~0.40 at 30 min, ~0.25 at 60 min
+
+    # Volatility regime adjustment: if vol_zscore is elevated, sigma is likely
+    # to stay elevated or spike further. Scale up the estimate.
+    vol_z = float(latest.get("vol_zscore_20", 0.0))
+    vol_regime_multiplier = 1.0
+    if vol_z > VOLATILITY_REGIME_THRESHOLDS["extreme_vol_cutoff"]:
+        vol_regime_multiplier = 1.5
+    elif vol_z > VOLATILITY_REGIME_THRESHOLDS["high_vol_cutoff"]:
+        vol_regime_multiplier = 1.2
+
     sigma_15min = sigma_per_minute * math.sqrt(15)
     implied_mu_15min = sigma_15min * norm.ppf(p_up_15min)
     implied_mu_per_minute = implied_mu_15min / 15.0
 
-    mu_total = implied_mu_per_minute * minutes_ahead
-    sigma_horizon = sigma_per_minute * math.sqrt(minutes_ahead)
+    # Apply time decay to the drift rate
+    decayed_mu_per_minute = implied_mu_per_minute * time_decay_factor
+
+    mu_total = decayed_mu_per_minute * minutes_ahead
+    sigma_horizon = sigma_per_minute * math.sqrt(minutes_ahead) * vol_regime_multiplier
 
     log_target_ratio = math.log(target_price / current_price)
     z = (log_target_ratio - mu_total) / sigma_horizon
@@ -209,6 +253,18 @@ def analyze_price_target(target_price: float, target_time_str: str):
 
     verdict = "YES" if prob_at_or_above >= 0.5 else "NO"
     confidence = max(prob_at_or_above, prob_below)
+
+    # -- NEW: Regime warning for the target analysis too --
+    regime_warning = None
+    if not np.isnan(vol_z):
+        if vol_z > VOLATILITY_REGIME_THRESHOLDS["extreme_vol_cutoff"]:
+            regime_warning = (
+                f"EXTREME volatility (vol_zscore={vol_z:.2f}). Model untested here."
+            )
+        elif vol_z > VOLATILITY_REGIME_THRESHOLDS["high_vol_cutoff"]:
+            regime_warning = (
+                f"Elevated volatility (vol_zscore={vol_z:.2f}). Edge is weaker."
+            )
 
     return {
         "verdict": verdict,
@@ -222,12 +278,15 @@ def analyze_price_target(target_price: float, target_time_str: str):
         "minutes_ahead": minutes_ahead,
         "required_move_pct": (target_price / current_price - 1) * 100,
         "sigma_per_minute_pct": sigma_per_minute * 100,
-        "implied_drift_per_minute_pct": implied_mu_per_minute * 100,
+        "implied_drift_per_minute_pct": decayed_mu_per_minute * 100,
+        "time_decay_factor": time_decay_factor,
+        "vol_regime_multiplier": vol_regime_multiplier,
         "rsi": float(latest.get("rsi_14", float("nan"))),
         "ema_dist": float(latest.get("ema_dist", float("nan"))),
         "ret_5": float(latest.get("ret_5", float("nan"))),
         "ret_15": float(latest.get("ret_15", float("nan"))),
-        "vol_z": float(latest.get("vol_zscore_20", float("nan"))),
+        "vol_z": vol_z,
         "p_up_15min": p_up_15min,
         "extrapolation_warning": minutes_ahead > 30,
+        "regime_warning": regime_warning,
     }

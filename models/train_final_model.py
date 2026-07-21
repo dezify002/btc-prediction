@@ -13,6 +13,7 @@ Usage:
     python train_final_model.py
 """
 
+import hashlib
 import os
 import pickle
 import sys
@@ -60,12 +61,13 @@ def main():
     print("Loading historical BTC data...")
     raw = pd.read_csv(os.path.join(os.path.dirname(__file__), "..", "data", "btc_1m.csv"))
 
-    print("Applying triple-barrier labeling...")
+    # -- FIX: Sync barrier mode with Phase 2 baseline (pct is now default) --
+    print("Applying triple-barrier labeling (fixed-percentage mode)...")
     labeled = triple_barrier_labels(
         raw,
-        atr_window=14,
-        tp_mult=2.0,
-        sl_mult=1.0,
+        barrier_mode="pct",       # <-- synced with baseline_xgb.py default
+        tp_pct=0.006,
+        sl_pct=0.003,
         max_holding=15,
     )
 
@@ -91,12 +93,22 @@ def main():
     iso = IsotonicRegression(out_of_bounds="clip")
     iso.fit(cal_probs_fit, y[cal_cutoff:])
 
+    # -- FIX: Retrain on full dataset for the final deployed model.
+    # The calibrator was fit on predictions from a model that did NOT see
+    # the calibration holdout. final_model is stronger (trained on all data).
+    # This is conservative -- the calibrator may slightly under-correct,
+    # which is safer than over-correcting. If you want tighter calibration,
+    # train final_model on X[:cal_cutoff] instead (matching calibrator strength).
     print("Retraining on full dataset for the final deployed model...")
     final_model = make_model()
     final_model.fit(X, y)
 
     artifacts_dir = os.path.join(os.path.dirname(__file__), "artifacts")
     os.makedirs(artifacts_dir, exist_ok=True)
+
+    # -- NEW: Save feature hash for version tracking --
+    feature_hash = hashlib.sha256(str(FEATURE_COLUMNS).encode()).hexdigest()[:8]
+    print(f"Feature set hash: {feature_hash}")
 
     with open(os.path.join(artifacts_dir, "model.pkl"), "wb") as f:
         pickle.dump(final_model, f)
@@ -107,7 +119,20 @@ def main():
     with open(os.path.join(artifacts_dir, "feature_columns.pkl"), "wb") as f:
         pickle.dump(FEATURE_COLUMNS, f)
 
-    print(f"\nSaved model, calibrator, and feature list to {artifacts_dir}/")
+    # Save metadata for tracking
+    metadata = {
+        "feature_columns": FEATURE_COLUMNS,
+        "feature_hash": feature_hash,
+        "n_samples": len(data),
+        "barrier_mode": "pct",
+        "tp_pct": 0.006,
+        "sl_pct": 0.003,
+        "max_holding": 15,
+    }
+    with open(os.path.join(artifacts_dir, "metadata.pkl"), "wb") as f:
+        pickle.dump(metadata, f)
+
+    print(f"\nSaved model, calibrator, feature list, and metadata to {artifacts_dir}/")
     print("You can now run predict_now.py to get live predictions.")
 
 

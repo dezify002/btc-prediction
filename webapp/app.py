@@ -43,6 +43,8 @@ INDEX_HTML = r"""
     --up: #3ECF8E;
     --down: #FF5C7A;
     --accent: #F0A94E;
+    --warning: #E8B860;
+    --danger: #FF5C7A;
     --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace;
     --sans: 'Inter', -apple-system, 'Segoe UI', sans-serif;
   }
@@ -121,11 +123,15 @@ INDEX_HTML = r"""
   .verdict-sub { color: var(--muted); font-size: 14px; margin-bottom: 16px; }
 
   .warning {
-    background: #2A2110; border: 1px solid #4A3A18; color: #E8B860;
+    background: #2A2110; border: 1px solid #4A3A18; color: var(--warning);
     border-radius: 6px; padding: 10px 12px; font-size: 13px; margin-top: 14px;
   }
   .error {
     background: #2A1414; border: 1px solid #4A1F1F; color: #FF9B9B;
+    border-radius: 6px; padding: 10px 12px; font-size: 13px; margin-top: 14px;
+  }
+  .danger {
+    background: #2A1414; border: 1px solid #4A1F1F; color: var(--danger);
     border-radius: 6px; padding: 10px 12px; font-size: 13px; margin-top: 14px;
   }
   .muted-note { color: var(--muted); font-size: 12px; margin-top: 16px; line-height: 1.5; }
@@ -190,6 +196,12 @@ async function loadNow() {
     const upPct = Math.round(data.p_up * 100);
     const downPct = 100 - upPct;
 
+    let warningHtml = '';
+    if (data.regime_warning) {
+      const isExtreme = data.regime_warning.includes('EXTREME');
+      warningHtml = `<div class="${isExtreme ? 'danger' : 'warning'}">${data.regime_warning}</div>`;
+    }
+
     let obHtml = '';
     if (data.order_book) {
       const lean = data.order_book.imbalance > 0 ? 'buy-side' : 'sell-side';
@@ -197,7 +209,7 @@ async function loadNow() {
         <div class="indicator-grid" style="margin-top:14px; border-top:1px solid var(--border); padding-top:14px;">
           <div class="label">Order book imbalance</div><div class="value">${data.order_book.imbalance.toFixed(3)} (${lean})</div>
         </div>
-        <div class="muted-note" style="margin-top:8px;">Order book signal is live-only context, not backtested against history.</div>
+        <div class="muted-note" style="margin-top:8px;"><strong>Experimental:</strong> Order book signal is live-only context, not backtested against history. Do not trade on it.</div>
       `;
     }
 
@@ -217,6 +229,7 @@ async function loadNow() {
         <div class="label">15-min momentum</div><div class="value">${fmtSigned(data.ret_15*100)}</div>
         <div class="label">Volume vs avg</div><div class="value">${data.vol_z.toFixed(2)} std</div>
       </div>
+      ${warningHtml}
       ${obHtml}
     `;
   } catch (err) {
@@ -243,7 +256,11 @@ async function submitTarget(event) {
     const isYes = data.verdict === 'YES';
     let warningHtml = '';
     if (data.extrapolation_warning) {
-      warningHtml = `<div class="warning">Your target is ${Math.round(data.minutes_ahead)} minutes away, but the model's directional signal was only trained/validated on a 15-minute horizon. Treat this with proportionally more skepticism the further out you go.</div>`;
+      warningHtml += `<div class="warning">Your target is ${Math.round(data.minutes_ahead)} minutes away, but the model's directional signal was only trained/validated on a 15-minute horizon. Treat this with proportionally more skepticism the further out you go.</div>`;
+    }
+    if (data.regime_warning) {
+      const isExtreme = data.regime_warning.includes('EXTREME');
+      warningHtml += `<div class="${isExtreme ? 'danger' : 'warning'}" style="margin-top:8px;">${data.regime_warning}</div>`;
     }
 
     resultEl.innerHTML = `
@@ -257,6 +274,8 @@ async function submitTarget(event) {
           <div class="label">Model P(up, 15m)</div><div class="value">${fmtPct(data.p_up_15min)}</div>
           <div class="label">RSI (14)</div><div class="value">${data.rsi.toFixed(1)}</div>
           <div class="label">Recent volatility</div><div class="value">${data.sigma_per_minute_pct.toFixed(4)}%/min</div>
+          <div class="label">Time-decay factor</div><div class="value">${data.time_decay_factor.toFixed(2)}</div>
+          <div class="label">Vol regime mult</div><div class="value">${data.vol_regime_multiplier.toFixed(1)}x</div>
         </div>
         ${warningHtml}
       </div>

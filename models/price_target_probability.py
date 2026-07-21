@@ -13,9 +13,11 @@ METHOD (read this before trusting the output):
      not a guess.
   3. Convert that probability into an implied drift (using the inverse
      normal distribution) rather than assuming no trend at all.
-  4. Combine that drift with recent volatility to project a probability
-     distribution over price at your target time, and read off the
-     probability of reaching your target.
+  4. Apply a time-decay factor to the drift (signal weakens as horizon
+     extends beyond 15 minutes) and a volatility regime multiplier to
+     sigma (elevated vol regimes are more unpredictable).
+  5. Combine that adjusted drift with adjusted volatility to project a
+     probability distribution over price at your target time.
 
 HONEST LIMITS -- this still isn't a crystal ball:
   - Your model was trained and validated specifically for a 15-MINUTE
@@ -47,6 +49,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "features"))
 from indicators import add_baseline_features  # noqa: E402
 
 ARTIFACTS_DIR = os.path.join(os.path.dirname(__file__), "artifacts")
+
+# Sync with prediction_core.py thresholds
+VOLATILITY_REGIME_THRESHOLDS = {
+    "high_vol_cutoff": 1.0,
+    "extreme_vol_cutoff": 2.0,
+}
 
 
 def fetch_recent_data(limit=1500):
@@ -176,24 +184,34 @@ def main():
     # clip away from exact 0/1 -- avoids -inf/+inf when converting to a z-score next
     p_up_15min = min(max(p_up_15min, 0.01), 0.99)
 
-    # -- recent volatility, same as before --
+    # -- recent volatility --
     log_returns = np.log(df["close"] / df["close"].shift(1)).dropna()
     sigma_per_minute = log_returns.std()
     if sigma_per_minute == 0 or np.isnan(sigma_per_minute):
         print("Could not estimate volatility from recent data -- try again.")
         sys.exit(1)
 
-    # -- convert the model's 15-minute directional probability into an implied
-    #    drift, using the fact that under a normal model,
-    #    P(up) = CDF(mu / sigma), so mu = sigma * inverse_CDF(P(up)) --
+    # -- FIX: Time-decay drift + volatility regime adjustment --
+    time_decay_factor = max(0.3, math.exp(-0.046 * minutes_ahead / 15))
+    # decay: 1.0 at 0 min, ~0.63 at 15 min, ~0.40 at 30 min, ~0.25 at 60 min
+
+    vol_z = float(latest.get("vol_zscore_20", 0.0))
+    vol_regime_multiplier = 1.0
+    if vol_z > VOLATILITY_REGIME_THRESHOLDS["extreme_vol_cutoff"]:
+        vol_regime_multiplier = 1.5
+    elif vol_z > VOLATILITY_REGIME_THRESHOLDS["high_vol_cutoff"]:
+        vol_regime_multiplier = 1.2
+
     sigma_15min = sigma_per_minute * math.sqrt(15)
     implied_mu_15min = sigma_15min * norm.ppf(p_up_15min)
     implied_mu_per_minute = implied_mu_15min / 15.0
 
+    # Apply time decay to the drift rate
+    decayed_mu_per_minute = implied_mu_per_minute * time_decay_factor
+
     # extrapolate that drift rate across the full horizon to the target time.
-    # this is the part that's speculative beyond ~15 minutes -- flagged below.
-    mu_total = implied_mu_per_minute * minutes_ahead
-    sigma_horizon = sigma_per_minute * math.sqrt(minutes_ahead)
+    mu_total = decayed_mu_per_minute * minutes_ahead
+    sigma_horizon = sigma_per_minute * math.sqrt(minutes_ahead) * vol_regime_multiplier
 
     log_target_ratio = math.log(target_price / current_price)
     z = (log_target_ratio - mu_total) / sigma_horizon
@@ -205,7 +223,6 @@ def main():
     ema_dist = latest.get("ema_dist", float("nan"))
     ret_5 = latest.get("ret_5", float("nan"))
     ret_15 = latest.get("ret_15", float("nan"))
-    vol_z = latest.get("vol_zscore_20", float("nan"))
 
     print("\n" + "=" * 60)
     print("TECHNICAL READ (what the model is actually seeing right now)")
@@ -219,6 +236,14 @@ def main():
     print(f"Volume vs recent avg:    {vol_z:+.2f} std devs")
     print(f"Model's P(up, next 15m): {p_up_15min*100:.1f}%  <- this is your trained, "
           f"validated model's actual output")
+
+    # -- regime warning --
+    if vol_z > VOLATILITY_REGIME_THRESHOLDS["extreme_vol_cutoff"]:
+        print(f"\n*** VOLATILITY WARNING: vol_zscore={vol_z:.2f} (extreme). "
+              f"Model untested here. Treat result as highly speculative. ***")
+    elif vol_z > VOLATILITY_REGIME_THRESHOLDS["high_vol_cutoff"]:
+        print(f"\n* Volatility elevated: vol_zscore={vol_z:.2f}. "
+              f"Edge is weaker per Phase 2/3. Treat with caution. *")
 
     verdict = "YES" if prob_at_or_above >= 0.5 else "NO"
     confidence = max(prob_at_or_above, prob_below) * 100
@@ -244,8 +269,10 @@ def main():
     print(f"Target BTC price:      ${target_price:,.2f}")
     print(f"Required move:         {(target_price/current_price - 1)*100:+.2f}%")
     print(f"Recent volatility:     {sigma_per_minute*100:.4f}% per minute")
-    print(f"Model-implied drift:   {implied_mu_per_minute*100:+.5f}% per minute "
-          f"(extrapolated from the 15-min signal above)")
+    print(f"Time-decay factor:     {time_decay_factor:.2f} (signal strength at this horizon)")
+    print(f"Vol regime multiplier: {vol_regime_multiplier:.1f}x")
+    print(f"Model-implied drift:   {decayed_mu_per_minute*100:+.5f}% per minute "
+          f"(decayed from {implied_mu_per_minute*100:+.5f}%)")
     print("-" * 60)
     print(f"P(BTC >= ${target_price:,.2f} by {fmt_time_12h(target_time)} UTC): "
           f"{prob_at_or_above*100:.1f}%")

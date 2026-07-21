@@ -179,19 +179,19 @@ def run_baseline(data: pd.DataFrame, n_folds: int = 5, label_horizon: int = 15, 
         X_train, y_train = X[train_idx], y[train_idx]
         X_test, y_test = X[test_idx], y[test_idx]
 
+        # -- FIX: Use the SAME model for predictions AND calibration --
+        # Train on the full training set first
         model = make_model(model_params)
         model.fit(X_train, y_train)
         raw_probs = model.predict_proba(X_test)[:, 1]
 
-        # calibrate using a held-out slice of TRAIN (not test) to fit isotonic regression
+        # Calibrate using predictions from THIS SAME model on a held-out slice
         cal_cutoff = int(len(X_train) * 0.85)
-        model_cal = make_model(model_params)
-        model_cal.fit(X_train[:cal_cutoff], y_train[:cal_cutoff])
-        cal_probs_fit = model_cal.predict_proba(X_train[cal_cutoff:])[:, 1]
+        cal_probs_fit = model.predict_proba(X_train[cal_cutoff:])[:, 1]
         iso = IsotonicRegression(out_of_bounds="clip")
         iso.fit(cal_probs_fit, y_train[cal_cutoff:])
 
-        calibrated_probs = iso.transform(model_cal.predict_proba(X_test)[:, 1])
+        calibrated_probs = iso.transform(raw_probs)
 
         auc = roc_auc_score(y_test, raw_probs)
         brier = brier_score_loss(y_test, calibrated_probs)

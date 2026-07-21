@@ -24,17 +24,19 @@ def add_baseline_features(df: pd.DataFrame,
     out["ema_21"] = close.ewm(span=21, adjust=False).mean()
     out["ema_dist"] = (out["ema_9"] - out["ema_21"]) / close
 
+    # Wilder's RSI (smoothed) -- canonical implementation
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
+    gain = delta.clip(lower=0)
+    loss = (-delta.clip(upper=0))
+    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     out["rsi_14"] = 100 - (100 / (1 + rs))
 
     # -- volatility --
     out["atr_14"] = out["atr"] if "atr" in out.columns else _atr(out, 14, high_col, low_col, close_col)
     out["realized_vol_20"] = close.pct_change().rolling(20).std()
-    # raw=True passes a numpy array instead of a pandas Series -- avoids
-    # object creation overhead per window, dramatically faster on large data
+    # Percentile rank of current ATR vs last 100 bars
     out["atr_pct_rank_100"] = out["atr_14"].rolling(100).apply(
         lambda x: (x <= x[-1]).mean(), raw=True
     )
@@ -75,8 +77,11 @@ def _atr(df, window, high_col, low_col, close_col):
     return tr.rolling(window).mean()
 
 
+# UPDATED: Added atr_14 and atr_pct_rank_100 so the model can directly
+# condition on volatility regime -- this is where Phase 2/3 found the edge.
 FEATURE_COLUMNS = [
     "ema_dist", "rsi_14",
+    "atr_14", "realized_vol_20", "atr_pct_rank_100",
     "ret_1", "ret_5", "ret_15", "dist_from_high_20", "dist_from_low_20",
     "vol_zscore_20", "hour_sin", "hour_cos",
 ]
