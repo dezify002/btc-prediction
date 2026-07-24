@@ -1,5 +1,5 @@
 """
-Local web frontend for BTC prediction tools.
+Local web frontend for BTC prediction tools with auto-refresh.
 """
 
 import os
@@ -71,6 +71,20 @@ INDEX_HTML = r"""
   .timestamp.fresh { color: var(--up); }
   .timestamp.warn { color: var(--warning); }
 
+  .live-indicator {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 11px; color: var(--up);
+    margin-bottom: 10px;
+  }
+  .live-indicator .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--up); animation: pulse 1.5s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
   .split-bar {
     height: 40px; border-radius: 8px; overflow: hidden; display: flex;
     border: 1px solid var(--border); margin-bottom: 10px;
@@ -141,13 +155,14 @@ INDEX_HTML = r"""
   <header>
     <div class="eyebrow">BTC / USDT</div>
     <h1>Prediction Terminal</h1>
-    <p>Multi-horizon model &mdash; 15m, 1h, 4h &mdash; auto-selected by target time.</p>
+    <p>Auto-refreshing every 10s &mdash; powered by Bitget API.</p>
   </header>
 
   <div class="panel">
     <h2>Right now &middot; next 15 minutes</h2>
+    <div class="live-indicator"><div class="dot"></div> LIVE &mdash; auto-refreshing</div>
     <div id="now-content"><div class="loading">Loading&hellip;</div></div>
-    <button class="refresh-btn" onclick="loadNow()">Refresh</button>
+    <button class="refresh-btn" onclick="loadNow()">Refresh Now</button>
   </div>
 
   <div class="panel">
@@ -183,13 +198,9 @@ function parseDate(isoString) {
   if (!isoString) return null;
   try {
     let d = new Date(isoString);
-    if (isNaN(d.getTime())) {
-      d = new Date(isoString + 'Z');
-    }
+    if (isNaN(d.getTime())) d = new Date(isoString + 'Z');
     return isNaN(d.getTime()) ? null : d;
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 function formatTimestamp(isoString) {
@@ -216,9 +227,13 @@ function getAgeLabel(ageSec) {
   return ' (STALE: ' + Math.round(ageSec) + 's old)';
 }
 
+let autoRefreshInterval = null;
+
 async function loadNow() {
   const el = document.getElementById('now-content');
-  el.innerHTML = '<div class="loading">Loading&hellip;</div>';
+  // Only show loading on manual refresh, not auto-refresh
+  if (!autoRefreshInterval) el.innerHTML = '<div class="loading">Loading&hellip;</div>';
+
   try {
     const res = await fetch('/api/now');
     const data = await res.json();
@@ -250,7 +265,7 @@ async function loadNow() {
 
     let staleWarning = '';
     if (ageSec > 300) {
-      staleWarning = `<div class="danger" style="margin-top:8px;">Data is ${Math.round(ageSec)} seconds old. Price may be stale. Try refreshing.</div>`;
+      staleWarning = `<div class="danger" style="margin-top:8px;">Data is ${Math.round(ageSec)} seconds old. Price may be stale.</div>`;
     }
 
     el.innerHTML = `
@@ -275,7 +290,7 @@ async function loadNow() {
       ${staleWarning}
     `;
   } catch (err) {
-    el.innerHTML = `<div class="error">Couldn't load a prediction: ${err.message}. Check that models are trained and exchanges are reachable.</div>`;
+    el.innerHTML = `<div class="error">Couldn't load a prediction: ${err.message}. Check that models are trained and Bitget API is reachable.</div>`;
   }
 }
 
@@ -328,7 +343,13 @@ async function submitTarget(event) {
   }
 }
 
-loadNow();
+// AUTO-REFRESH: poll every 10 seconds
+function startAutoRefresh() {
+  loadNow();
+  autoRefreshInterval = setInterval(loadNow, 10000); // 10 seconds
+}
+
+startAutoRefresh();
 </script>
 </body>
 </html>
