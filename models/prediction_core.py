@@ -1,7 +1,8 @@
 """
-Shared prediction logic with Bitget API integration.
+Shared prediction logic with Bitget SPOT API integration.
 
-Uses Bitget REST API for live price data instead of ccxt multi-exchange fallback.
+Uses Bitget Spot REST API for live price data.
+Corrected field names based on official Bitget Spot API docs.
 """
 
 import math
@@ -26,7 +27,7 @@ VOLATILITY_REGIME_THRESHOLDS = {
     "extreme_vol_cutoff": 2.0,
 }
 
-# Bitget API endpoints
+# Bitget SPOT API endpoints
 BITGET_BASE = "https://api.bitget.com"
 BITGET_TICKER = "/api/spot/v1/market/ticker?symbol=BTCUSDT_SPBL"
 BITGET_CANDLES = "/api/spot/v1/market/candles?symbol=BTCUSDT_SPBL&granularity=60&limit={limit}"
@@ -68,7 +69,14 @@ def select_horizon(minutes_ahead: float) -> str:
 
 
 def fetch_bitget_ticker():
-    """Fetch live BTC price from Bitget."""
+    """Fetch live BTC price from Bitget SPOT API.
+
+    Correct field names per Bitget Spot API docs:
+    - close = last price
+    - buyOne = best bid
+    - sellOne = best ask
+    - ts = timestamp (milliseconds)
+    """
     try:
         resp = requests.get(BITGET_BASE + BITGET_TICKER, timeout=10)
         resp.raise_for_status()
@@ -77,11 +85,11 @@ def fetch_bitget_ticker():
         if data.get("code") != "00000":
             raise RuntimeError(f"Bitget API error: {data}")
 
-        ticker = data["data"][0]
+        ticker = data["data"]
         return {
-            "price": float(ticker["close"]),
-            "bid": float(ticker["bidPr"]),
-            "ask": float(ticker["askPr"]),
+            "price": float(ticker["close"]),        # Spot uses "close" not "last"
+            "bid": float(ticker["buyOne"]),         # Spot uses "buyOne" not "bidPr"
+            "ask": float(ticker["sellOne"]),        # Spot uses "sellOne" not "askPr"
             "high_24h": float(ticker["high24h"]),
             "low_24h": float(ticker["low24h"]),
             "volume_24h": float(ticker["baseVol"]),
@@ -93,12 +101,15 @@ def fetch_bitget_ticker():
 
 
 def fetch_bitget_candles(limit=1500):
-    """Fetch 1-minute candles from Bitget for feature calculation.
+    """Fetch 1-minute candles from Bitget Spot for feature calculation.
 
-    Bitget granularity: 60 = 1 minute
+    Bitget Spot granularity: 60 = 1 minute
+    Max limit per request: 200 (Bitget limit)
     """
     try:
-        url = BITGET_BASE + BITGET_CANDLES.format(limit=min(limit, 200))  # Bitget max 200 per request
+        # Bitget max limit is 200 per request
+        fetch_limit = min(limit, 200)
+        url = BITGET_BASE + BITGET_CANDLES.format(limit=fetch_limit)
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
@@ -107,7 +118,7 @@ def fetch_bitget_candles(limit=1500):
             raise RuntimeError(f"Bitget API error: {data}")
 
         candles = data["data"]
-        # Bitget format: [timestamp, open, high, low, close, volume]
+        # Bitget Spot candle format: [timestamp, open, high, low, close, volume]
         df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms", utc=True)
         df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
@@ -118,7 +129,7 @@ def fetch_bitget_candles(limit=1500):
 
 
 def fetch_order_book_signal():
-    """Bitget order book (live-only, not backtested)."""
+    """Bitget Spot order book (live-only, not backtested)."""
     try:
         url = BITGET_BASE + "/api/spot/v1/market/depth?symbol=BTCUSDT_SPBL&limit=50"
         resp = requests.get(url, timeout=10)
@@ -209,9 +220,13 @@ def get_current_prediction():
         elif vol_z > VOLATILITY_REGIME_THRESHOLDS["high_vol_cutoff"]:
             regime_warning = f"Elevated volatility (vol_zscore={vol_z:.2f}). Edge is weaker."
 
+    # Use LIVE TICKER PRICE
+    live_price = live_ticker["price"]
+    live_timestamp = datetime.fromtimestamp(live_ticker["timestamp"] / 1000, tz=timezone.utc).isoformat()
+
     return {
-        "timestamp": datetime.fromtimestamp(live_ticker["timestamp"] / 1000, tz=timezone.utc).isoformat(),
-        "price": live_ticker["price"],
+        "timestamp": live_timestamp,
+        "price": live_price,
         "p_up": p_up,
         "p_down": 1 - p_up,
         "rsi": float(latest.get("rsi_14", float("nan"))),
@@ -223,7 +238,7 @@ def get_current_prediction():
         "regime_warning": regime_warning,
         "model_used": horizon_used,
         "exchange_used": "bitget",
-        "data_source": "bitget_api",
+        "data_source": "bitget_spot_api",
     }
 
 
@@ -324,5 +339,5 @@ def analyze_price_target(target_price: float, target_time_str: str):
         "extrapolation_warning": extrapolation_warning,
         "regime_warning": regime_warning,
         "exchange_used": "bitget",
-        "data_source": "bitget_api",
+        "data_source": "bitget_spot_api",
     }
