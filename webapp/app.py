@@ -1,400 +1,468 @@
 """
-Local web frontend for BTC prediction tools with auto-refresh.
+BTC Prediction Bot — Web UI with Ensemble Display
+Shows: live price, bot prediction, XGBoost prediction, AI Reviewer verdict
 """
 
 import os
 import sys
-from datetime import datetime, timezone
-
-from flask import Flask, jsonify, render_template_string, request
+import json
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "models"))
-import prediction_core as core
+
+from flask import Flask, jsonify, request, render_template_string
+from prediction_core import get_full_prediction, analyze_price_target
 
 app = Flask(__name__)
 
-
-INDEX_HTML = r"""
+# ── HTML Template ──────────────────────────────────────────
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BTC Terminal</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<title>BTC Prediction Bot — Ensemble</title>
 <style>
-  :root {
-    --bg: #0B0E14;
-    --surface: #131824;
-    --surface-2: #171D2B;
-    --border: #232B3B;
-    --text: #E8ECF2;
-    --muted: #7C8797;
-    --up: #3ECF8E;
-    --down: #FF5C7A;
-    --accent: #F0A94E;
-    --warning: #E8B860;
-    --danger: #FF5C7A;
-    --info: #5B8DEF;
-    --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace;
-    --sans: 'Inter', -apple-system, 'Segoe UI', sans-serif;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font-family: var(--sans);
-    padding: 24px 16px 64px;
-  }
-  .wrap { max-width: 720px; margin: 0 auto; }
-  header { margin-bottom: 28px; }
-  header .eyebrow {
-    font-family: var(--mono); font-size: 12px; letter-spacing: 0.12em;
-    color: var(--accent); text-transform: uppercase; margin-bottom: 6px;
-  }
-  header h1 { font-size: 22px; font-weight: 700; margin: 0; }
-  header p { color: var(--muted); font-size: 14px; margin: 6px 0 0; }
+:root {
+    --bg: #0d1117; --card: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+    --up: #3fb950; --down: #f85149; --warn: #d29922;
+    --strong: #a371f7;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; padding: 20px;
+}
+.container { max-width: 900px; margin: 0 auto; }
+h1 { text-align:center; margin-bottom: 8px; font-size: 1.4rem; }
+.subtitle { text-align:center; color: var(--muted); font-size: 0.8rem; margin-bottom: 24px; }
 
-  .panel {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 10px; padding: 20px; margin-bottom: 20px;
-  }
-  .panel h2 {
-    font-size: 13px; font-weight: 600; letter-spacing: 0.06em;
-    text-transform: uppercase; color: var(--muted); margin: 0 0 16px;
-  }
+.card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px; margin-bottom: 16px;
+}
+.card h2 { font-size: 1rem; margin-bottom: 12px; color: var(--accent); }
 
-  .price-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px; }
-  .price { font-family: var(--mono); font-size: 28px; font-weight: 700; }
-  .timestamp { font-family: var(--mono); font-size: 12px; }
-  .timestamp.stale { color: var(--danger); }
-  .timestamp.fresh { color: var(--up); }
-  .timestamp.warn { color: var(--warning); }
+/* Price display */
+.price-row { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+.price-main { font-size: 2.2rem; font-weight: bold; }
+.price-change { font-size: 0.85rem; }
+.meta { color: var(--muted); font-size: 0.75rem; }
 
-  .live-indicator {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-family: var(--mono); font-size: 11px; color: var(--up);
-    margin-bottom: 10px;
-  }
-  .live-indicator .dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--up); animation: pulse 1.5s infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
+/* LIVE indicator */
+.live-dot {
+    display: inline-block; width: 8px; height: 8px;
+    background: var(--up); border-radius: 50%;
+    margin-right: 6px; animation: pulse 1.5s infinite;
+}
+@keyframes pulse {
+    0% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(1.3); }
+    100% { opacity: 1; transform: scale(1); }
+}
 
-  .split-bar {
-    height: 40px; border-radius: 8px; overflow: hidden; display: flex;
-    border: 1px solid var(--border); margin-bottom: 10px;
-  }
-  .split-bar .up { background: var(--up); display: flex; align-items: center; justify-content: center; }
-  .split-bar .down { background: var(--down); display: flex; align-items: center; justify-content: center; }
-  .split-bar span { font-family: var(--mono); font-weight: 700; font-size: 14px; color: #0B0E14; }
+/* Ensemble grid */
+.ensemble-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+.model-box {
+    background: rgba(0,0,0,0.2); border-radius: 8px; padding: 14px;
+    border: 1px solid var(--border);
+}
+.model-box h3 { font-size: 0.8rem; color: var(--muted); margin-bottom: 6px; }
+.model-pred { font-size: 1.3rem; font-weight: bold; }
+.model-conf { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
 
-  .indicator-grid {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 10px 20px;
-    font-family: var(--mono); font-size: 13px; margin-top: 16px;
-  }
-  .indicator-grid .label { color: var(--muted); }
-  .indicator-grid .value { text-align: right; }
+/* Verdict */
+.verdict-box {
+    text-align: center; padding: 16px; border-radius: 10px;
+    margin: 16px 0; border: 2px solid;
+}
+.verdict-strong { border-color: var(--up); background: rgba(63,185,80,0.1); }
+.verdict-moderate { border-color: var(--accent); background: rgba(88,166,255,0.1); }
+.verdict-weak { border-color: var(--warn); background: rgba(210,153,34,0.1); }
+.verdict-uncertain { border-color: var(--muted); background: rgba(139,148,158,0.1); }
+.verdict-skip { border-color: var(--down); background: rgba(248,81,73,0.1); }
 
-  .refresh-btn, .submit-btn {
-    background: var(--accent); color: #0B0E14; border: none; border-radius: 6px;
-    font-family: var(--sans); font-weight: 600; font-size: 14px;
-    padding: 10px 18px; cursor: pointer; margin-top: 4px;
-  }
-  .refresh-btn:hover, .submit-btn:hover { opacity: 0.88; }
+.verdict-title { font-size: 1.5rem; font-weight: bold; margin-bottom: 4px; }
+.verdict-sub { font-size: 0.85rem; color: var(--muted); }
 
-  form { display: flex; flex-direction: column; gap: 12px; }
-  .field-row { display: flex; gap: 12px; }
-  .field { flex: 1; }
-  .field label {
-    display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px;
-    font-family: var(--mono);
-  }
-  .field input {
-    width: 100%; background: var(--surface-2); border: 1px solid var(--border);
-    color: var(--text); font-family: var(--mono); font-size: 15px;
-    padding: 10px 12px; border-radius: 6px;
-  }
+/* Trust score bar */
+.trust-bar-container {
+    width: 100%; height: 20px; background: rgba(0,0,0,0.3);
+    border-radius: 10px; overflow: hidden; margin: 12px 0;
+}
+.trust-bar {
+    height: 100%; border-radius: 10px;
+    transition: width 0.5s ease;
+}
+.trust-high { background: linear-gradient(90deg, #238636, #3fb950); }
+.trust-medium { background: linear-gradient(90deg, #9e6a03, #d29922); }
+.trust-low { background: linear-gradient(90deg, #da3633, #f85149); }
 
-  .verdict-block { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border); }
-  .verdict-headline {
-    font-family: var(--mono); font-size: 32px; font-weight: 700; margin-bottom: 4px;
-  }
-  .verdict-headline.yes { color: var(--up); }
-  .verdict-headline.no { color: var(--down); }
-  .verdict-sub { color: var(--muted); font-size: 14px; margin-bottom: 16px; }
+/* Reasons */
+.reasons { list-style: none; }
+.reasons li {
+    padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);
+    font-size: 0.8rem; display: flex; align-items: center;
+}
+.reasons li::before {
+    content: "→"; margin-right: 8px; color: var(--accent);
+}
+.reasons li.warning::before { content: "⚠"; color: var(--warn); }
+.reasons li.danger::before { content: "✕"; color: var(--down); }
+.reasons li.good::before { content: "✓"; color: var(--up); }
 
-  .model-badge {
-    display: inline-block; background: var(--surface-2); border: 1px solid var(--border);
-    color: var(--info); font-family: var(--mono); font-size: 11px;
-    padding: 3px 8px; border-radius: 4px; margin-bottom: 12px;
-  }
+/* Risk badge */
+.risk-badge {
+    display: inline-block; padding: 4px 12px; border-radius: 4px;
+    font-size: 0.75rem; font-weight: bold; text-transform: uppercase;
+}
+.risk-low { background: rgba(63,185,80,0.2); color: var(--up); }
+.risk-medium { background: rgba(88,166,255,0.2); color: var(--accent); }
+.risk-elevated { background: rgba(210,153,34,0.2); color: var(--warn); }
+.risk-high { background: rgba(248,81,73,0.2); color: var(--down); }
 
-  .warning {
-    background: #2A2110; border: 1px solid #4A3A18; color: var(--warning);
-    border-radius: 6px; padding: 10px 12px; font-size: 13px; margin-top: 14px;
-  }
-  .error {
-    background: #2A1414; border: 1px solid #4A1F1F; color: #FF9B9B;
-    border-radius: 6px; padding: 10px 12px; font-size: 13px; margin-top: 14px;
-  }
-  .danger {
-    background: #2A1414; border: 1px solid #4A1F1F; color: var(--danger);
-    border-radius: 6px; padding: 10px 12px; font-size: 13px; margin-top: 14px;
-  }
-  .muted-note { color: var(--muted); font-size: 12px; margin-top: 16px; line-height: 1.5; }
-  .loading { color: var(--muted); font-family: var(--mono); font-size: 13px; }
+/* Features table */
+.features-table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
+.features-table td { padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.features-table td:first-child { color: var(--muted); width: 50%; }
+
+/* Target analysis */
+.target-form { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.target-form input {
+    background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); padding: 8px 12px; border-radius: 6px;
+    font-family: inherit; font-size: 0.85rem; flex: 1;
+}
+.target-form button {
+    background: var(--accent); color: #fff; border: none;
+    padding: 8px 16px; border-radius: 6px; cursor: pointer;
+    font-family: inherit; font-weight: bold;
+}
+.target-form button:hover { opacity: 0.9; }
+
+/* Refresh */
+.refresh-row { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
+.refresh-btn {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--text); padding: 6px 14px; border-radius: 6px;
+    cursor: pointer; font-family: inherit; font-size: 0.8rem;
+}
+.refresh-btn:hover { border-color: var(--accent); }
+
+/* Auto-refresh indicator */
+.auto-refresh-status {
+    font-size: 0.7rem; color: var(--muted);
+    display: flex; align-items: center; gap: 6px;
+}
+
+/* Debug log */
+#debugLog {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px; font-size: 0.7rem;
+    color: var(--muted); max-height: 120px; overflow-y: auto;
+    margin-top: 8px; display: none;
+}
+
+.up { color: var(--up); }
+.down { color: var(--down); }
+.warn { color: var(--warn); }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div class="eyebrow">BTC / USDT</div>
-    <h1>Prediction Terminal</h1>
-    <p>Auto-refreshing every 10s &mdash; powered by Bitget API.</p>
-  </header>
+<div class="container">
+    <h1>🪙 BTC Prediction Bot</h1>
+    <p class="subtitle">Ensemble: Your Bot + XGBoost + AI Reviewer</p>
 
-  <div class="panel">
-    <h2>Right now &middot; next 15 minutes</h2>
-    <div class="live-indicator"><div class="dot"></div> LIVE &mdash; auto-refreshing</div>
-    <div id="now-content"><div class="loading">Loading&hellip;</div></div>
-    <button class="refresh-btn" onclick="loadNow()">Refresh Now</button>
-  </div>
-
-  <div class="panel">
-    <h2>Ask about a target</h2>
-    <form id="target-form" onsubmit="submitTarget(event)">
-      <div class="field-row">
-        <div class="field">
-          <label for="price">Target price ($)</label>
-          <input type="text" id="price" placeholder="64000" required>
+    <!-- Live Price -->
+    <div class="card">
+        <div class="price-row">
+            <div>
+                <div class="price-main" id="priceDisplay">—</div>
+                <div class="meta" id="priceMeta">Loading...</div>
+            </div>
+            <div style="text-align:right">
+                <div class="auto-refresh-status">
+                    <span class="live-dot"></span>
+                    <span id="refreshStatus">LIVE</span>
+                </div>
+                <div class="meta" id="exchangeBadge">—</div>
+            </div>
         </div>
-        <div class="field">
-          <label for="time">Target time (UTC, 12-hour)</label>
-          <input type="text" id="time" placeholder="4:30pm" required>
+        <div class="refresh-row">
+            <span class="meta" id="lastUpdate">—</span>
+            <button class="refresh-btn" onclick="loadNow()">Refresh Now</button>
         </div>
-      </div>
-      <button type="submit" class="submit-btn">Analyze</button>
-    </form>
-    <div id="target-result"></div>
-  </div>
+        <div id="debugLog"></div>
+    </div>
 
-  <p class="muted-note">
-    Per Phase 2/3 testing on 2023&ndash;2024 data, this model's edge is modest overall
-    and was not profitable after realistic trading fees. Treat every result on this
-    page as informational context, not a guarantee.
-  </p>
+    <!-- Ensemble Predictions -->
+    <div class="card">
+        <h2>🔮 Ensemble Predictions</h2>
+        <div class="ensemble-grid">
+            <div class="model-box">
+                <h3>YOUR BOT</h3>
+                <div class="model-pred" id="botPred">—</div>
+                <div class="model-conf" id="botConf">—</div>
+            </div>
+            <div class="model-box">
+                <h3>XGBOOST</h3>
+                <div class="model-pred" id="xgbPred">—</div>
+                <div class="model-conf" id="xgbConf">—</div>
+            </div>
+        </div>
+
+        <!-- Verdict -->
+        <div class="verdict-box" id="verdictBox">
+            <div class="verdict-title" id="verdictTitle">—</div>
+            <div class="verdict-sub" id="verdictSub">—</div>
+        </div>
+
+        <!-- Trust Score -->
+        <div style="margin: 12px 0;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                <span class="meta">Trust Score</span>
+                <span class="meta" id="trustScore">—</span>
+            </div>
+            <div class="trust-bar-container">
+                <div class="trust-bar" id="trustBar" style="width:0%"></div>
+            </div>
+        </div>
+
+        <!-- Risk & Recommendation -->
+        <div style="display:flex; gap:12px; align-items:center; margin: 12px 0;">
+            <span class="meta">Risk:</span>
+            <span class="risk-badge" id="riskBadge">—</span>
+            <span class="meta">|</span>
+            <span class="meta" id="recommendation">—</span>
+        </div>
+
+        <!-- Reasons -->
+        <h3 style="font-size:0.8rem; color:var(--muted); margin:16px 0 8px;">AI Reviewer Reasons</h3>
+        <ul class="reasons" id="reasonsList">
+            <li>Loading...</li>
+        </ul>
+    </div>
+
+    <!-- Market Regime -->
+    <div class="card">
+        <h2>📊 Market Regime</h2>
+        <div class="meta" id="marketRegime">—</div>
+        <table class="features-table" id="featuresTable">
+            <tr><td>Loading features...</td><td>—</td></tr>
+        </table>
+    </div>
+
+    <!-- Target Analysis -->
+    <div class="card">
+        <h2>🎯 Target Analysis</h2>
+        <div class="target-form">
+            <input type="number" id="targetPrice" placeholder="Target price (e.g. 67000)" step="1">
+            <input type="text" id="targetTime" placeholder="Time (e.g. 14:30 or 2026-07-25 14:30)">
+            <button onclick="analyzeTarget()">Analyze</button>
+        </div>
+        <div id="targetResult"></div>
+    </div>
 </div>
 
 <script>
-function fmtPct(x) { return (x * 100).toFixed(1) + '%'; }
-function fmtSigned(x, digits) { digits = digits || 3; return (x >= 0 ? '+' : '') + x.toFixed(digits) + '%'; }
-
-function parseDate(isoString) {
-  if (!isoString) return null;
-  try {
-    let d = new Date(isoString);
-    if (isNaN(d.getTime())) d = new Date(isoString + 'Z');
-    return isNaN(d.getTime()) ? null : d;
-  } catch (e) { return null; }
-}
-
-function formatTimestamp(isoString) {
-  const d = parseDate(isoString);
-  if (!d) return 'Invalid Date';
-  return d.toUTCString();
-}
-
-function getAgeSeconds(isoString) {
-  const d = parseDate(isoString);
-  if (!d) return 9999;
-  return (Date.now() - d.getTime()) / 1000;
-}
-
-function getAgeClass(ageSec) {
-  if (ageSec < 60) return 'fresh';
-  if (ageSec < 300) return 'warn';
-  return 'stale';
-}
-
-function getAgeLabel(ageSec) {
-  if (ageSec < 60) return '';
-  if (ageSec < 300) return ' (' + Math.round(ageSec) + 's old)';
-  return ' (STALE: ' + Math.round(ageSec) + 's old)';
-}
-
 let autoRefreshInterval = null;
+let lastData = null;
+
+function log(msg) {
+    const el = document.getElementById("debugLog");
+    el.style.display = "block";
+    const time = new Date().toLocaleTimeString();
+    el.innerHTML += `[${time}] ${msg}<br>`;
+    el.scrollTop = el.scrollHeight;
+}
+
+function getVerdictClass(verdict) {
+    if (verdict.includes("Strong")) return "verdict-strong";
+    if (verdict.includes("Moderate")) return "verdict-moderate";
+    if (verdict.includes("Weak")) return "verdict-weak";
+    if (verdict.includes("UNCERTAIN")) return "verdict-uncertain";
+    if (verdict.includes("SKIP")) return "verdict-skip";
+    return "verdict-uncertain";
+}
+
+function getTrustClass(score) {
+    if (score >= 0.7) return "trust-high";
+    if (score >= 0.4) return "trust-medium";
+    return "trust-low";
+}
+
+function getRiskClass(risk) {
+    const map = { "LOW": "risk-low", "MEDIUM": "risk-medium", "ELEVATED": "risk-elevated", "HIGH": "risk-high" };
+    return map[risk] || "risk-high";
+}
+
+function formatPrice(p) {
+    return "$" + parseFloat(p).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
 
 async function loadNow() {
-  const el = document.getElementById('now-content');
-  // Only show loading on manual refresh, not auto-refresh
-  if (!autoRefreshInterval) el.innerHTML = '<div class="loading">Loading&hellip;</div>';
-
-  try {
-    const res = await fetch('/api/now');
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Request failed');
-
-    const upPct = Math.round(data.p_up * 100);
-    const downPct = 100 - upPct;
-    const tsStr = formatTimestamp(data.timestamp);
-    const ageSec = getAgeSeconds(data.timestamp);
-    const ageClass = getAgeClass(ageSec);
-    const ageLabel = getAgeLabel(ageSec);
-
-    let warningHtml = '';
-    if (data.regime_warning) {
-      const isExtreme = data.regime_warning.includes('EXTREME');
-      warningHtml = `<div class="${isExtreme ? 'danger' : 'warning'}">${data.regime_warning}</div>`;
+    log("Fetching /api/now...");
+    try {
+        const res = await fetch("/api/now");
+        log(`Response status: ${res.status}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        log("Data received successfully");
+        render(data);
+        lastData = data;
+    } catch (e) {
+        log(`ERROR: ${e.message}`);
+        console.error(e);
     }
-
-    let obHtml = '';
-    if (data.order_book) {
-      const lean = data.order_book.imbalance > 0 ? 'buy-side' : 'sell-side';
-      obHtml = `
-        <div class="indicator-grid" style="margin-top:14px; border-top:1px solid var(--border); padding-top:14px;">
-          <div class="label">Order book imbalance</div><div class="value">${data.order_book.imbalance.toFixed(3)} (${lean})</div>
-        </div>
-        <div class="muted-note" style="margin-top:8px;"><strong>Experimental:</strong> Order book signal is live-only context, not backtested against history. Do not trade on it.</div>
-      `;
-    }
-
-    let staleWarning = '';
-    if (ageSec > 300) {
-      staleWarning = `<div class="danger" style="margin-top:8px;">Data is ${Math.round(ageSec)} seconds old. Price may be stale.</div>`;
-    }
-
-    el.innerHTML = `
-      <div class="model-badge">Model: ${data.model_used || '15m'} | Source: ${data.exchange_used || 'unknown'}</div>
-      <div class="price-row">
-        <div class="price">$${data.price.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</div>
-        <div class="timestamp ${ageClass}">${tsStr}${ageLabel}</div>
-      </div>
-      <div class="split-bar">
-        <div class="up" style="width:${upPct}%"><span>${upPct >= 15 ? upPct + '% UP' : ''}</span></div>
-        <div class="down" style="width:${downPct}%"><span>${downPct >= 15 ? downPct + '% DOWN' : ''}</span></div>
-      </div>
-      <div class="indicator-grid">
-        <div class="label">RSI (14)</div><div class="value">${data.rsi.toFixed(1)}</div>
-        <div class="label">EMA(9) vs EMA(21)</div><div class="value">${fmtSigned(data.ema_dist*100)}</div>
-        <div class="label">5-min momentum</div><div class="value">${fmtSigned(data.ret_5*100)}</div>
-        <div class="label">15-min momentum</div><div class="value">${fmtSigned(data.ret_15*100)}</div>
-        <div class="label">Volume vs avg</div><div class="value">${data.vol_z.toFixed(2)} std</div>
-      </div>
-      ${warningHtml}
-      ${obHtml}
-      ${staleWarning}
-    `;
-  } catch (err) {
-    el.innerHTML = `<div class="error">Couldn't load a prediction: ${err.message}. Check that models are trained and Bitget API is reachable.</div>`;
-  }
 }
 
-async function submitTarget(event) {
-  event.preventDefault();
-  const price = document.getElementById('price').value;
-  const time = document.getElementById('time').value;
-  const resultEl = document.getElementById('target-result');
-  resultEl.innerHTML = '<div class="loading" style="margin-top:16px;">Analyzing&hellip;</div>';
+function render(data) {
+    // Price
+    document.getElementById("priceDisplay").textContent = formatPrice(data.price);
+    document.getElementById("priceMeta").innerHTML = 
+        `Spread: <span class="${data.spread_pct > 0.05 ? 'warn' : ''}">${data.spread_pct.toFixed(4)}%</span>`;
+    document.getElementById("exchangeBadge").textContent = `Source: ${data.exchange}`;
 
-  try {
-    const res = await fetch('/api/target', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({price, time})
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Request failed');
+    const ts = data.timestamp ? new Date(data.timestamp + 'Z') : new Date();
+    document.getElementById("lastUpdate").textContent = ts.toUTCString();
 
-    const isYes = data.verdict === 'YES';
-    let warningHtml = '';
-    if (data.extrapolation_warning) {
-      warningHtml += `<div class="warning">Your target is ${Math.round(data.minutes_ahead)} minutes away, but the model's directional signal was only trained/validated on a ${data.trained_horizon_min}-minute horizon. Treat this with proportionally more skepticism the further out you go.</div>`;
-    }
-    if (data.regime_warning) {
-      const isExtreme = data.regime_warning.includes('EXTREME');
-      warningHtml += `<div class="${isExtreme ? 'danger' : 'warning'}" style="margin-top:8px;">${data.regime_warning}</div>`;
-    }
+    // Bot
+    const bot = data.bot || {};
+    document.getElementById("botPred").textContent = bot.pred || "—";
+    document.getElementById("botPred").className = "model-pred " + (bot.pred === "UP" ? "up" : bot.pred === "DOWN" ? "down" : "");
+    document.getElementById("botConf").textContent = bot.confidence ? `Confidence: ${(bot.confidence * 100).toFixed(1)}%` : "—";
 
-    resultEl.innerHTML = `
-      <div class="verdict-block">
-        <div class="model-badge">Model: ${data.model_used} (trained for ${data.trained_horizon_min}m)</div>
-        <div class="verdict-headline ${isYes ? 'yes' : 'no'}">${data.verdict}</div>
-        <div class="verdict-sub">BTC is more likely to be ${isYes ? 'AT OR ABOVE' : 'BELOW'} $${Number(data.target_price).toLocaleString()} &middot; confidence ${fmtPct(data.confidence)}</div>
-        <div class="indicator-grid">
-          <div class="label">Current price</div><div class="value">$${data.current_price.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
-          <div class="label">Required move</div><div class="value">${fmtSigned(data.required_move_pct, 2)}</div>
-          <div class="label">Time remaining</div><div class="value">${Math.round(data.minutes_ahead)} min</div>
-          <div class="label">Model P(up, ${data.trained_horizon_min}m)</div><div class="value">${fmtPct(data.p_up_trained_horizon)}</div>
-          <div class="label">RSI (14)</div><div class="value">${data.rsi.toFixed(1)}</div>
-          <div class="label">Recent volatility</div><div class="value">${data.sigma_per_minute_pct.toFixed(4)}%/min</div>
-          <div class="label">Time-decay factor</div><div class="value">${data.time_decay_factor.toFixed(2)}</div>
-          <div class="label">Vol regime mult</div><div class="value">${data.vol_regime_multiplier.toFixed(1)}x</div>
-        </div>
-        ${warningHtml}
-      </div>
-    `;
-  } catch (err) {
-    resultEl.innerHTML = `<div class="error">${err.message}</div>`;
-  }
+    // XGBoost
+    const xgb = data.xgboost || {};
+    document.getElementById("xgbPred").textContent = xgb.pred || "—";
+    document.getElementById("xgbPred").className = "model-pred " + (xgb.pred === "UP" ? "up" : xgb.pred === "DOWN" ? "down" : "");
+    document.getElementById("xgbConf").textContent = xgb.prob ? `P(UP): ${(xgb.prob * 100).toFixed(1)}%` : "—";
+
+    // Decision
+    const dec = data.decision || {};
+    const vBox = document.getElementById("verdictBox");
+    vBox.className = "verdict-box " + getVerdictClass(dec.ensemble_verdict || "");
+    document.getElementById("verdictTitle").textContent = dec.ensemble_verdict || "—";
+    document.getElementById("verdictSub").textContent = dec.recommendation || "—";
+
+    // Trust score
+    const ts_score = dec.trust_score || 0;
+    document.getElementById("trustScore").textContent = (ts_score * 100).toFixed(1) + "%";
+    const bar = document.getElementById("trustBar");
+    bar.style.width = (ts_score * 100) + "%";
+    bar.className = "trust-bar " + getTrustClass(ts_score);
+
+    // Risk
+    document.getElementById("riskBadge").textContent = dec.risk_level || "—";
+    document.getElementById("riskBadge").className = "risk-badge " + getRiskClass(dec.risk_level);
+    document.getElementById("recommendation").textContent = dec.recommendation || "—";
+
+    // Reasons
+    const reasons = dec.reasons || ["No reasons available"];
+    document.getElementById("reasonsList").innerHTML = reasons.map(r => {
+        let cls = "";
+        if (r.includes("DISAGREEMENT") || r.includes("dangerous") || r.includes("risky") || r.includes("unreliable")) cls = "danger";
+        else if (r.includes("High") || r.includes("spike") || r.includes("avoid")) cls = "warning";
+        else if (r.includes("agree") || r.includes("favorable") || r.includes("Low volatility")) cls = "good";
+        return `<li class="${cls}">${r}</li>`;
+    }).join("");
+
+    // Regime
+    document.getElementById("marketRegime").textContent = dec.market_regime || "—";
+
+    // Features table
+    const feats = data.features || {};
+    const featRows = Object.entries(feats).slice(0, 15).map(([k, v]) => {
+        const val = typeof v === "number" ? v.toFixed(4) : v;
+        return `<tr><td>${k}</td><td>${val}</td></tr>`;
+    }).join("");
+    document.getElementById("featuresTable").innerHTML = featRows || "<tr><td>No features</td></tr>";
 }
 
-// AUTO-REFRESH: poll every 10 seconds
+async function analyzeTarget() {
+    const price = document.getElementById("targetPrice").value;
+    const time = document.getElementById("targetTime").value;
+    if (!price || !time) {
+        document.getElementById("targetResult").innerHTML = '<p class="warn">Enter both price and time</p>';
+        return;
+    }
+    document.getElementById("targetResult").innerHTML = '<p class="meta">Analyzing...</p>';
+    try {
+        const res = await fetch(`/api/target?price=${price}&time=${encodeURIComponent(time)}`);
+        const data = await res.json();
+        if (data.error) {
+            document.getElementById("targetResult").innerHTML = `<p class="down">Error: ${data.error}</p>`;
+            return;
+        }
+        let html = `
+            <div style="margin-top:12px; padding:12px; background:rgba(0,0,0,0.2); border-radius:8px;">
+                <div style="font-size:1.3rem; font-weight:bold; margin-bottom:8px;">
+                    ${data.verdict} — ${(data.verdict_confidence * 100).toFixed(1)}%
+                </div>
+                <div class="meta">Current: ${formatPrice(data.current_price)} → Target: ${formatPrice(data.target_price)}</div>
+                <div class="meta">Horizon: ${data.minutes_ahead} min | P(above): ${(data.probability_above * 100).toFixed(1)}%</div>
+                <div class="meta">Time decay: ${(data.time_decay_factor * 100).toFixed(0)}% | Vol mult: ${data.vol_regime_multiplier}x</div>
+        `;
+        if (data.warnings && data.warnings.length > 0) {
+            html += `<div style="margin-top:8px; color:var(--warn); font-size:0.8rem;">`;
+            data.warnings.forEach(w => html += `⚠ ${w}<br>`);
+            html += `</div>`;
+        }
+        html += `</div>`;
+        document.getElementById("targetResult").innerHTML = html;
+    } catch (e) {
+        document.getElementById("targetResult").innerHTML = `<p class="down">Error: ${e.message}</p>`;
+    }
+}
+
+// Auto-refresh every 15 seconds
 function startAutoRefresh() {
-  loadNow();
-  autoRefreshInterval = setInterval(loadNow, 10000); // 10 seconds
+    if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+    autoRefreshInterval = setInterval(loadNow, 15000);
+    document.getElementById("refreshStatus").textContent = "AUTO-REFRESH ON";
 }
 
+// Init
+loadNow();
 startAutoRefresh();
 </script>
 </body>
 </html>
 """
 
+# ── API Routes ─────────────────────────────────────────────
 
 @app.route("/")
 def index():
-    return render_template_string(INDEX_HTML)
+    return render_template_string(HTML_TEMPLATE)
 
 
 @app.route("/api/now")
 def api_now():
     try:
-        result = core.get_current_prediction()
-        result["server_time"] = datetime.now(timezone.utc).isoformat()
+        result = get_full_prediction()
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/target", methods=["POST"])
+@app.route("/api/target")
 def api_target():
-    body = request.get_json(force=True)
     try:
-        price = float(str(body.get("price", "")).replace(",", "").replace("$", ""))
-    except (ValueError, TypeError):
-        return jsonify({"error": "Couldn't parse that price. Enter a plain number, e.g. 64000"}), 400
-
-    time_str = str(body.get("time", "")).strip()
-    if not time_str:
-        return jsonify({"error": "Enter a target time, e.g. 4:30pm"}), 400
-
-    try:
-        result = core.analyze_price_target(price, time_str)
-        result["server_time"] = datetime.now(timezone.utc).isoformat()
+        price = float(request.args.get("price", 0))
+        time_str = request.args.get("time", "")
+        if not price or not time_str:
+            return jsonify({"error": "Missing price or time"}), 400
+        result = analyze_price_target(price, time_str)
         return jsonify(result)
-    except ValueError:
-        return jsonify({"error": "Couldn't parse that time. Try formats like 10am, 2:30pm, 14:30"}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ── Main ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print("Starting BTC prediction terminal...")
-    print(f"Open http://localhost:{port} in your browser.")
     app.run(debug=False, host="0.0.0.0", port=port)
