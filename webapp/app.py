@@ -1,24 +1,15 @@
 """
-Local web frontend for your BTC prediction tools.
-
-Run this, then open http://localhost:5000 in your browser. It wraps the
-same trained model and analysis used by predict_now.py and
-price_target_probability.py -- no new logic, just a browser UI on top
-of prediction_core.py.
-
-Requires: pip install flask --break-system-packages
-
-Usage:
-    python app.py
+Local web frontend for BTC prediction tools.
 """
 
 import os
 import sys
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string, request
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "models"))
-import prediction_core as core  # noqa: E402
+import prediction_core as core
 
 app = Flask(__name__)
 
@@ -45,6 +36,7 @@ INDEX_HTML = r"""
     --accent: #F0A94E;
     --warning: #E8B860;
     --danger: #FF5C7A;
+    --info: #5B8DEF;
     --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace;
     --sans: 'Inter', -apple-system, 'Segoe UI', sans-serif;
   }
@@ -74,7 +66,10 @@ INDEX_HTML = r"""
 
   .price-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px; }
   .price { font-family: var(--mono); font-size: 28px; font-weight: 700; }
-  .timestamp { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .timestamp { font-family: var(--mono); font-size: 12px; }
+  .timestamp.stale { color: var(--danger); }
+  .timestamp.fresh { color: var(--up); }
+  .timestamp.warn { color: var(--warning); }
 
   .split-bar {
     height: 40px; border-radius: 8px; overflow: hidden; display: flex;
@@ -97,9 +92,6 @@ INDEX_HTML = r"""
     padding: 10px 18px; cursor: pointer; margin-top: 4px;
   }
   .refresh-btn:hover, .submit-btn:hover { opacity: 0.88; }
-  .refresh-btn:focus-visible, .submit-btn:focus-visible, input:focus-visible {
-    outline: 2px solid var(--accent); outline-offset: 2px;
-  }
 
   form { display: flex; flex-direction: column; gap: 12px; }
   .field-row { display: flex; gap: 12px; }
@@ -122,6 +114,12 @@ INDEX_HTML = r"""
   .verdict-headline.no { color: var(--down); }
   .verdict-sub { color: var(--muted); font-size: 14px; margin-bottom: 16px; }
 
+  .model-badge {
+    display: inline-block; background: var(--surface-2); border: 1px solid var(--border);
+    color: var(--info); font-family: var(--mono); font-size: 11px;
+    padding: 3px 8px; border-radius: 4px; margin-bottom: 12px;
+  }
+
   .warning {
     background: #2A2110; border: 1px solid #4A3A18; color: var(--warning);
     border-radius: 6px; padding: 10px 12px; font-size: 13px; margin-top: 14px;
@@ -136,10 +134,6 @@ INDEX_HTML = r"""
   }
   .muted-note { color: var(--muted); font-size: 12px; margin-top: 16px; line-height: 1.5; }
   .loading { color: var(--muted); font-family: var(--mono); font-size: 13px; }
-
-  @media (prefers-reduced-motion: reduce) {
-    * { transition: none !important; }
-  }
 </style>
 </head>
 <body>
@@ -147,7 +141,7 @@ INDEX_HTML = r"""
   <header>
     <div class="eyebrow">BTC / USDT</div>
     <h1>Prediction Terminal</h1>
-    <p>Backed by your trained model &mdash; not a trading signal, an informed estimate.</p>
+    <p>Multi-horizon model &mdash; 15m, 1h, 4h &mdash; auto-selected by target time.</p>
   </header>
 
   <div class="panel">
@@ -185,6 +179,43 @@ INDEX_HTML = r"""
 function fmtPct(x) { return (x * 100).toFixed(1) + '%'; }
 function fmtSigned(x, digits) { digits = digits || 3; return (x >= 0 ? '+' : '') + x.toFixed(digits) + '%'; }
 
+function parseDate(isoString) {
+  if (!isoString) return null;
+  try {
+    let d = new Date(isoString);
+    if (isNaN(d.getTime())) {
+      d = new Date(isoString + 'Z');
+    }
+    return isNaN(d.getTime()) ? null : d;
+  } catch (e) {
+    return null;
+  }
+}
+
+function formatTimestamp(isoString) {
+  const d = parseDate(isoString);
+  if (!d) return 'Invalid Date';
+  return d.toUTCString();
+}
+
+function getAgeSeconds(isoString) {
+  const d = parseDate(isoString);
+  if (!d) return 9999;
+  return (Date.now() - d.getTime()) / 1000;
+}
+
+function getAgeClass(ageSec) {
+  if (ageSec < 60) return 'fresh';
+  if (ageSec < 300) return 'warn';
+  return 'stale';
+}
+
+function getAgeLabel(ageSec) {
+  if (ageSec < 60) return '';
+  if (ageSec < 300) return ' (' + Math.round(ageSec) + 's old)';
+  return ' (STALE: ' + Math.round(ageSec) + 's old)';
+}
+
 async function loadNow() {
   const el = document.getElementById('now-content');
   el.innerHTML = '<div class="loading">Loading&hellip;</div>';
@@ -195,6 +226,10 @@ async function loadNow() {
 
     const upPct = Math.round(data.p_up * 100);
     const downPct = 100 - upPct;
+    const tsStr = formatTimestamp(data.timestamp);
+    const ageSec = getAgeSeconds(data.timestamp);
+    const ageClass = getAgeClass(ageSec);
+    const ageLabel = getAgeLabel(ageSec);
 
     let warningHtml = '';
     if (data.regime_warning) {
@@ -213,10 +248,16 @@ async function loadNow() {
       `;
     }
 
+    let staleWarning = '';
+    if (ageSec > 300) {
+      staleWarning = `<div class="danger" style="margin-top:8px;">Data is ${Math.round(ageSec)} seconds old. Price may be stale. Try refreshing.</div>`;
+    }
+
     el.innerHTML = `
+      <div class="model-badge">Model: ${data.model_used || '15m'} | Source: ${data.exchange_used || 'unknown'}</div>
       <div class="price-row">
         <div class="price">$${data.price.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</div>
-        <div class="timestamp">${new Date(data.timestamp + 'Z').toUTCString()}</div>
+        <div class="timestamp ${ageClass}">${tsStr}${ageLabel}</div>
       </div>
       <div class="split-bar">
         <div class="up" style="width:${upPct}%"><span>${upPct >= 15 ? upPct + '% UP' : ''}</span></div>
@@ -231,9 +272,10 @@ async function loadNow() {
       </div>
       ${warningHtml}
       ${obHtml}
+      ${staleWarning}
     `;
   } catch (err) {
-    el.innerHTML = `<div class="error">Couldn't load a prediction: ${err.message}. Check that train_final_model.py has been run, and that this machine can reach Binance.</div>`;
+    el.innerHTML = `<div class="error">Couldn't load a prediction: ${err.message}. Check that models are trained and exchanges are reachable.</div>`;
   }
 }
 
@@ -256,7 +298,7 @@ async function submitTarget(event) {
     const isYes = data.verdict === 'YES';
     let warningHtml = '';
     if (data.extrapolation_warning) {
-      warningHtml += `<div class="warning">Your target is ${Math.round(data.minutes_ahead)} minutes away, but the model's directional signal was only trained/validated on a 15-minute horizon. Treat this with proportionally more skepticism the further out you go.</div>`;
+      warningHtml += `<div class="warning">Your target is ${Math.round(data.minutes_ahead)} minutes away, but the model's directional signal was only trained/validated on a ${data.trained_horizon_min}-minute horizon. Treat this with proportionally more skepticism the further out you go.</div>`;
     }
     if (data.regime_warning) {
       const isExtreme = data.regime_warning.includes('EXTREME');
@@ -265,13 +307,14 @@ async function submitTarget(event) {
 
     resultEl.innerHTML = `
       <div class="verdict-block">
+        <div class="model-badge">Model: ${data.model_used} (trained for ${data.trained_horizon_min}m)</div>
         <div class="verdict-headline ${isYes ? 'yes' : 'no'}">${data.verdict}</div>
         <div class="verdict-sub">BTC is more likely to be ${isYes ? 'AT OR ABOVE' : 'BELOW'} $${Number(data.target_price).toLocaleString()} &middot; confidence ${fmtPct(data.confidence)}</div>
         <div class="indicator-grid">
           <div class="label">Current price</div><div class="value">$${data.current_price.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
           <div class="label">Required move</div><div class="value">${fmtSigned(data.required_move_pct, 2)}</div>
           <div class="label">Time remaining</div><div class="value">${Math.round(data.minutes_ahead)} min</div>
-          <div class="label">Model P(up, 15m)</div><div class="value">${fmtPct(data.p_up_15min)}</div>
+          <div class="label">Model P(up, ${data.trained_horizon_min}m)</div><div class="value">${fmtPct(data.p_up_trained_horizon)}</div>
           <div class="label">RSI (14)</div><div class="value">${data.rsi.toFixed(1)}</div>
           <div class="label">Recent volatility</div><div class="value">${data.sigma_per_minute_pct.toFixed(4)}%/min</div>
           <div class="label">Time-decay factor</div><div class="value">${data.time_decay_factor.toFixed(2)}</div>
@@ -300,7 +343,9 @@ def index():
 @app.route("/api/now")
 def api_now():
     try:
-        return jsonify(core.get_current_prediction())
+        result = core.get_current_prediction()
+        result["server_time"] = datetime.now(timezone.utc).isoformat()
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -319,6 +364,7 @@ def api_target():
 
     try:
         result = core.analyze_price_target(price, time_str)
+        result["server_time"] = datetime.now(timezone.utc).isoformat()
         return jsonify(result)
     except ValueError:
         return jsonify({"error": "Couldn't parse that time. Try formats like 10am, 2:30pm, 14:30"}), 400
@@ -330,4 +376,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("Starting BTC prediction terminal...")
     print(f"Open http://localhost:{port} in your browser.")
-    app.run(debug=False, host="0.0.0.0", port=port) 
+    app.run(debug=False, host="0.0.0.0", port=port)
