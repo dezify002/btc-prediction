@@ -1,8 +1,8 @@
 """
-Shared prediction logic with Bitget SPOT API integration.
+Shared prediction logic using ccxt with Bitget as primary, fallback to Binance/Coinbase/Kraken.
 
-Uses Bitget Spot REST API for live price data.
-Corrected field names based on official Bitget Spot API docs.
+Uses ccxt.fetch_ticker() for live price (not stale OHLCV close).
+Uses ccxt.fetch_ohlcv() for feature calculation.
 """
 
 import math
@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
-import requests
 from scipy.stats import norm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "features"))
@@ -27,10 +26,13 @@ VOLATILITY_REGIME_THRESHOLDS = {
     "extreme_vol_cutoff": 2.0,
 }
 
-# Bitget SPOT API endpoints
-BITGET_BASE = "https://api.bitget.com"
-BITGET_TICKER = "/api/spot/v1/market/ticker?symbol=BTCUSDT_SPBL"
-BITGET_CANDLES = "/api/spot/v1/market/candles?symbol=BTCUSDT_SPBL&granularity=60&limit={limit}"
+# Exchange fallback order: Bitget first, then Binance, Coinbase, Kraken
+EXCHANGE_FALLBACK_ORDER = [
+    ("bitget", "BTC/USDT"),
+    ("binance", "BTC/USDT"),
+    ("coinbase", "BTC/USD"),
+    ("kraken", "BTC/USD"),
+]
 
 
 def load_model(horizon: str = "15m"):
@@ -68,94 +70,75 @@ def select_horizon(minutes_ahead: float) -> str:
         return "4h"
 
 
-def fetch_bitget_ticker():
-    """Fetch live BTC price from Bitget SPOT API.
+def _try_exchanges(action):
+    """Tries each exchange in EXCHANGE_FALLBACK_ORDER, returns (result, exchange_name)."""
+    import ccxt
+    last_error = None
+    for exchange_id, symbol in EXCHANGE_FALLBACK_ORDER:
+        try:
+            exchange_cls = getattr(ccxt, exchange_id)
+            exchange = exchange_cls({"enableRateLimit": True})
+            result = action(exchange, symbol)
+            return result, exchange_id
+        except Exception as e:
+            last_error = e
+            print(f"[fallback] {exchange_id} failed: {e}")
+            continue
+    raise RuntimeError(
+        f"Could not reach any exchange (tried {[e for e, _ in EXCHANGE_FALLBACK_ORDER]}). "
+        f"Last error: {last_error}"
+    )
 
-    Correct field names per Bitget Spot API docs:
-    - close = last price
-    - buyOne = best bid
-    - sellOne = best ask
-    - ts = timestamp (milliseconds)
-    """
-    try:
-        resp = requests.get(BITGET_BASE + BITGET_TICKER, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
 
-        if data.get("code") != "00000":
-            raise RuntimeError(f"Bitget API error: {data}")
-
-        ticker = data["data"]
+def fetch_live_ticker():
+    """Fetch live BTC price via ccxt.fetch_ticker() — uses Bitget first, falls back to others."""
+    def action(exchange, symbol):
+        ticker = exchange.fetch_ticker(symbol)
+        if not ticker or "last" not in ticker:
+            raise RuntimeError("No ticker data returned.")
         return {
-            "price": float(ticker["close"]),        # Spot uses "close" not "last"
-            "bid": float(ticker["buyOne"]),         # Spot uses "buyOne" not "bidPr"
-            "ask": float(ticker["sellOne"]),        # Spot uses "sellOne" not "askPr"
-            "high_24h": float(ticker["high24h"]),
-            "low_24h": float(ticker["low24h"]),
-            "volume_24h": float(ticker["baseVol"]),
-            "timestamp": int(ticker["ts"]),
-            "exchange_used": "bitget",
+            "price": float(ticker["last"]),
+            "bid": float(ticker.get("bid", ticker["last"])),
+            "ask": float(ticker.get("ask", ticker["last"])),
+            "timestamp": ticker.get("timestamp"),
+            "datetime": ticker.get("datetime"),
         }
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch Bitget ticker: {e}")
+
+    result, exchange_used = _try_exchanges(action)
+    result["exchange_used"] = exchange_used
+    return result
 
 
-def fetch_bitget_candles(limit=1500):
-    """Fetch 1-minute candles from Bitget Spot for feature calculation.
+def fetch_recent_candles(limit=200):
+    """Fetch 1-minute OHLCV bars via ccxt for feature calculation."""
+    def action(exchange, symbol):
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1m", limit=limit)
+        if not ohlcv:
+            raise RuntimeError("No candle data returned.")
+        return ohlcv
 
-    Bitget Spot granularity: 60 = 1 minute
-    Max limit per request: 200 (Bitget limit)
-    """
-    try:
-        # Bitget max limit is 200 per request
-        fetch_limit = min(limit, 200)
-        url = BITGET_BASE + BITGET_CANDLES.format(limit=fetch_limit)
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("code") != "00000":
-            raise RuntimeError(f"Bitget API error: {data}")
-
-        candles = data["data"]
-        # Bitget Spot candle format: [timestamp, open, high, low, close, volume]
-        df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms", utc=True)
-        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
-        df.attrs["exchange_used"] = "bitget"
-        return df
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch Bitget candles: {e}")
+    ohlcv, exchange_used = _try_exchanges(action)
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.attrs["exchange_used"] = exchange_used
+    return df
 
 
 def fetch_order_book_signal():
-    """Bitget Spot order book (live-only, not backtested)."""
-    try:
-        url = BITGET_BASE + "/api/spot/v1/market/depth?symbol=BTCUSDT_SPBL&limit=50"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("code") != "00000":
-            return None
-
-        book = data["data"]
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
-
-        bid_volume = sum(float(qty) for _, qty, _ in bids) if bids else 0
-        ask_volume = sum(float(qty) for _, qty, _ in asks) if asks else 0
+    """Live order book imbalance (not backtested)."""
+    def action(exchange, symbol):
+        book = exchange.fetch_order_book(symbol, limit=50)
+        bid_volume = sum(qty for _, qty in book["bids"])
+        ask_volume = sum(qty for _, qty in book["asks"])
         total = bid_volume + ask_volume
-
         if total == 0:
-            return None
-
+            raise RuntimeError("Empty order book.")
         imbalance = (bid_volume - ask_volume) / total
-        return {
-            "bid_volume": bid_volume,
-            "ask_volume": ask_volume,
-            "imbalance": imbalance,
-        }
+        return {"bid_volume": bid_volume, "ask_volume": ask_volume, "imbalance": imbalance}
+
+    try:
+        result, _ = _try_exchanges(action)
+        return result
     except Exception:
         return None
 
@@ -194,11 +177,12 @@ def parse_target_time(time_str: str, now_utc: datetime) -> datetime:
 
 
 def get_current_prediction():
-    """Returns prediction using Bitget live ticker + recent candles for features."""
+    """Returns prediction using live ticker price + recent candles for features."""
     model, calibrator, feature_columns, horizon_used = load_model("15m")
 
-    live_ticker = fetch_bitget_ticker()
-    df = fetch_bitget_candles(limit=200)
+    # Fetch live price AND recent bars
+    live_ticker = fetch_live_ticker()
+    df = fetch_recent_candles(limit=200)
 
     featured = add_baseline_features(df)
     complete = featured.dropna(subset=feature_columns)
@@ -222,7 +206,7 @@ def get_current_prediction():
 
     # Use LIVE TICKER PRICE
     live_price = live_ticker["price"]
-    live_timestamp = datetime.fromtimestamp(live_ticker["timestamp"] / 1000, tz=timezone.utc).isoformat()
+    live_timestamp = live_ticker.get("datetime") or live_ticker.get("timestamp")
 
     return {
         "timestamp": live_timestamp,
@@ -237,19 +221,24 @@ def get_current_prediction():
         "order_book": ob_signal,
         "regime_warning": regime_warning,
         "model_used": horizon_used,
-        "exchange_used": "bitget",
-        "data_source": "bitget_spot_api",
+        "exchange_used": live_ticker.get("exchange_used", "unknown"),
+        "data_source": "ccxt_live_ticker",
     }
 
 
 def analyze_price_target(target_price: float, target_time_str: str):
     """Uses multi-horizon model selection based on target time."""
-    live_ticker = fetch_bitget_ticker()
-    df = fetch_bitget_candles(limit=200)
+    live_ticker = fetch_live_ticker()
+    df = fetch_recent_candles(limit=200)
 
     featured = add_baseline_features(df)
 
-    horizon = select_horizon(0)
+    # Determine horizon FIRST, then load the right model
+    now_utc = datetime.now(timezone.utc)
+    target_time = parse_target_time(target_time_str, now_utc)
+    minutes_ahead = (target_time - now_utc).total_seconds() / 60.0
+
+    horizon = select_horizon(minutes_ahead)
     model, calibrator, feature_columns, _ = load_model(horizon)
 
     complete = featured.dropna(subset=feature_columns)
@@ -259,13 +248,6 @@ def analyze_price_target(target_price: float, target_time_str: str):
     latest = complete.iloc[-1]
 
     current_price = live_ticker["price"]
-    now_utc = datetime.now(timezone.utc)
-
-    target_time = parse_target_time(target_time_str, now_utc)
-    minutes_ahead = (target_time - now_utc).total_seconds() / 60.0
-
-    horizon = select_horizon(minutes_ahead)
-    model, calibrator, feature_columns, _ = load_model(horizon)
 
     X_latest = latest[feature_columns].values.reshape(1, -1).astype(float)
     raw_prob = model.predict_proba(X_latest)[0, 1]
@@ -338,6 +320,6 @@ def analyze_price_target(target_price: float, target_time_str: str):
         "trained_horizon_min": trained_horizon,
         "extrapolation_warning": extrapolation_warning,
         "regime_warning": regime_warning,
-        "exchange_used": "bitget",
-        "data_source": "bitget_spot_api",
+        "exchange_used": live_ticker.get("exchange_used", "unknown"),
+        "data_source": "ccxt_live_ticker",
     }
