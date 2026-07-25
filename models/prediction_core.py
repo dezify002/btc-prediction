@@ -1,6 +1,9 @@
 """
 Integrated Prediction Core — fetches live data, runs bot + XGBoost,
 calls decision engine, logs result, returns full context to UI.
+
+PHASE 4 UPDATE: Now logs target_price, prediction_window, and
+returns log_timestamp for outcome tracking.
 """
 
 import os
@@ -23,7 +26,7 @@ from triple_barrier import triple_barrier_labels
 sys.path.append(os.path.dirname(__file__))
 from decision_engine import decide, classify_regime
 
-# Logger
+# Logger — Phase 4 enhanced
 from logger import log_prediction
 
 try:
@@ -41,6 +44,11 @@ EXCHANGE_FALLBACK_ORDER = [
 ]
 
 ARTIFACTS_DIR = os.path.join(os.path.dirname(__file__), "artifacts")
+
+# Default prediction parameters (match your triple barrier)
+DEFAULT_PROFIT_PCT = 0.006   # +0.6%
+DEFAULT_STOP_PCT = 0.003     # -0.3%
+DEFAULT_WINDOW = "15m"
 
 # ── Load Models ──────────────────────────────────────────────
 _model_cache = {}
@@ -197,12 +205,17 @@ def predict_xgb(features: dict, artifacts: dict) -> dict:
 
 # ── Main Entry Point ────────────────────────────────────────
 
-def get_full_prediction() -> dict:
+def get_full_prediction(prediction_window: str = DEFAULT_WINDOW,
+                         profit_pct: float = DEFAULT_PROFIT_PCT,
+                         stop_pct: float = DEFAULT_STOP_PCT) -> dict:
     """
     Full pipeline: fetch data → features → bot + XGB → decision engine → log → return.
+
+    PHASE 4: Now logs target_price, prediction_window, and returns log_timestamp.
     """
     # 1. Fetch live data
     data = fetch_live_data()
+    current_price = data["price"]
 
     # 2. Compute features
     features = compute_features(data["ohlcv"])
@@ -222,10 +235,21 @@ def get_full_prediction() -> dict:
         features=features,
     )
 
-    # 6. Log prediction
+    # 6. Compute target price from prediction direction
+    if decision["ensemble_verdict"] and "UP" in decision["ensemble_verdict"]:
+        target_price = current_price * (1 + profit_pct)
+    elif decision["ensemble_verdict"] and "DOWN" in decision["ensemble_verdict"]:
+        target_price = current_price * (1 - stop_pct)
+    else:
+        target_price = current_price
+
+    # 7. Log prediction (Phase 4 enhanced)
+    log_timestamp = None
     try:
-        log_prediction(
-            current_price=data["price"],
+        log_record = log_prediction(
+            current_price=current_price,
+            target_price=round(target_price, 2),
+            prediction_window=prediction_window,
             prediction=decision["ensemble_verdict"],
             confidence=decision["trust_score"],
             xgb_prob=xgb_result["prob"],
@@ -236,12 +260,16 @@ def get_full_prediction() -> dict:
             market_regime=decision["market_regime"],
             ensemble_verdict=decision["ensemble_verdict"],
             trust_score=decision["trust_score"],
+            decision=decision.get("recommendation", "UNKNOWN"),
+            risk_level=decision.get("risk", "UNKNOWN"),
+            reasons=decision.get("reasons", []),
         )
+        log_timestamp = log_record.get("timestamp")
     except Exception as e:
         # Don't crash if logging fails
         print(f"Logging warning: {e}")
 
-    # 7. Build response
+    # 8. Build response
     response = {
         "timestamp": data["timestamp"],
         "price": round(data["price"], 2),
@@ -253,9 +281,39 @@ def get_full_prediction() -> dict:
         "bot": bot_result,
         "xgboost": xgb_result,
         "decision": decision,
+        "target_price": round(target_price, 2),
+        "prediction_window": prediction_window,
+        "log_timestamp": log_timestamp,  # PHASE 4: for outcome tracking
     }
 
     return response
+
+
+# ── Outcome Update (Phase 4) ───────────────────────────────
+
+def update_prediction_outcome(log_timestamp: str, actual_price: float) -> dict:
+    """
+    Update a logged prediction with its actual outcome.
+
+    Call this after the prediction window closes.
+
+    Args:
+        log_timestamp: The timestamp returned from get_full_prediction()
+        actual_price: The actual price at the end of the prediction window
+
+    Returns:
+        dict with success status and computed correctness
+    """
+    from logger import update_outcome
+
+    # We need to find the original prediction to know target and direction
+    # For now, we'll accept actual_result as "UP" or "DOWN" from the caller
+    # This function is a placeholder — the web app should call update_outcome directly
+    return {
+        "status": "Use logger.update_outcome(timestamp, actual_result, correct) directly",
+        "log_timestamp": log_timestamp,
+        "actual_price": actual_price,
+    }
 
 
 # ── Target Analysis (price target probability) ─────────────
