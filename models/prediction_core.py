@@ -36,6 +36,25 @@ try:
 except ImportError:
     HAS_CCXT = False
 
+# ── NumPy → Native Type Converter ──────────────────────────
+
+def _to_native(obj):
+    """Recursively convert NumPy types to Python native types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: _to_native(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_native(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return _to_native(obj.tolist())
+    return obj
+
+
 # ── Configuration ──────────────────────────────────────────
 EXCHANGE_FALLBACK_ORDER = [
     ("bitget", "BTC/USDT"),
@@ -182,9 +201,9 @@ def predict_bot(features: dict, artifacts: dict) -> dict:
             prob = float(calibrated[0])
 
     pred = "UP" if prob >= 0.5 else "DOWN"
-    confidence = prob if pred == "UP" else 1 - prob
+    confidence = float(prob) if pred == "UP" else float(1 - prob)
 
-    return {"pred": pred, "confidence": round(confidence, 4), "prob": round(prob, 4)}
+    return {"pred": pred, "confidence": round(confidence, 4), "prob": round(float(prob), 4)}
 
 
 def predict_xgb(features: dict, artifacts: dict) -> dict:
@@ -207,9 +226,9 @@ def predict_xgb(features: dict, artifacts: dict) -> dict:
             prob = float(calibrated[0])
 
     pred = "UP" if prob >= threshold else "DOWN"
-    confidence = prob if pred == "UP" else 1 - prob
+    confidence = float(prob) if pred == "UP" else float(1 - prob)
 
-    return {"pred": pred, "confidence": round(confidence, 4), "prob": round(prob, 4)}
+    return {"pred": pred, "confidence": round(confidence, 4), "prob": round(float(prob), 4)}
 
 
 # ── Main Entry Point ────────────────────────────────────────
@@ -281,21 +300,22 @@ def get_full_prediction(prediction_window: str = DEFAULT_WINDOW,
     # 8. Build response
     response = {
         "timestamp": data["timestamp"],
-        "price": round(data["price"], 2),
-        "bid": round(data["bid"], 2),
-        "ask": round(data["ask"], 2),
-        "spread_pct": round(data["spread_pct"], 4),
-        "exchange": data["exchange"],
-        "features": {k: round(v, 6) if isinstance(v, float) else v for k, v in features.items()},
+        "price": round(float(data["price"]), 2),
+        "bid": round(float(data["bid"]), 2),
+        "ask": round(float(data["ask"]), 2),
+        "spread_pct": round(float(data["spread_pct"]), 4),
+        "exchange": str(data["exchange"]),
+        "features": {k: round(float(v), 6) if isinstance(v, (float, np.floating)) else int(v) if isinstance(v, (int, np.integer)) else bool(v) if isinstance(v, np.bool_) else v for k, v in features.items()},
         "bot": bot_result,
         "xgboost": xgb_result,
         "decision": decision,
-        "target_price": round(target_price, 2),
+        "target_price": round(float(target_price), 2),
         "prediction_window": prediction_window,
         "log_timestamp": log_timestamp,  # PHASE 4: for outcome tracking
     }
 
-    return response
+    # Convert any remaining NumPy types to native Python types for JSON
+    return _to_native(response)
 
 
 # ── Target Analysis (price target probability) ─────────────
