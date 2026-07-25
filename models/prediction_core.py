@@ -11,6 +11,7 @@ import sys
 import json
 import pickle
 import math
+import re
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -174,7 +175,11 @@ def predict_bot(features: dict, artifacts: dict) -> dict:
     prob = model.predict_proba(X)[0, 1]
 
     if calibrator:
-        prob = float(calibrator.transform(np.array([[prob]]))[0, 0])
+        calibrated = calibrator.transform(np.array([[prob]]))
+        if calibrated.ndim == 2:
+            prob = float(calibrated[0, 0])
+        else:
+            prob = float(calibrated[0])
 
     pred = "UP" if prob >= 0.5 else "DOWN"
     confidence = prob if pred == "UP" else 1 - prob
@@ -195,7 +200,11 @@ def predict_xgb(features: dict, artifacts: dict) -> dict:
     prob = model.predict_proba(X)[0, 1]
 
     if calibrator:
-        prob = float(calibrator.transform(np.array([[prob]]))[0, 0])
+        calibrated = calibrator.transform(np.array([[prob]]))
+        if calibrated.ndim == 2:
+            prob = float(calibrated[0, 0])
+        else:
+            prob = float(calibrated[0])
 
     pred = "UP" if prob >= threshold else "DOWN"
     confidence = prob if pred == "UP" else 1 - prob
@@ -289,56 +298,115 @@ def get_full_prediction(prediction_window: str = DEFAULT_WINDOW,
     return response
 
 
-# ── Outcome Update (Phase 4) ───────────────────────────────
-
-def update_prediction_outcome(log_timestamp: str, actual_price: float) -> dict:
-    """
-    Update a logged prediction with its actual outcome.
-
-    Call this after the prediction window closes.
-
-    Args:
-        log_timestamp: The timestamp returned from get_full_prediction()
-        actual_price: The actual price at the end of the prediction window
-
-    Returns:
-        dict with success status and computed correctness
-    """
-    from logger import update_outcome
-
-    # We need to find the original prediction to know target and direction
-    # For now, we'll accept actual_result as "UP" or "DOWN" from the caller
-    # This function is a placeholder — the web app should call update_outcome directly
-    return {
-        "status": "Use logger.update_outcome(timestamp, actual_result, correct) directly",
-        "log_timestamp": log_timestamp,
-        "actual_price": actual_price,
-    }
-
-
 # ── Target Analysis (price target probability) ─────────────
+
+def _normalize_time_string(time_str: str) -> str:
+    """
+    Normalize messy time inputs into something parseable.
+    Handles: 2;00am, 2:00am, 2.00am, 2am, 14:30, 2:00 pm, 12:00pm, etc.
+    """
+    if not time_str:
+        return time_str
+
+    s = time_str.strip().lower()
+
+    # Replace common separators with colon
+    s = s.replace(";", ":").replace(".", ":")
+
+    # Remove spaces around am/pm
+    s = s.replace(" am", "am").replace(" pm", "pm")
+    s = s.replace("a.m", "am").replace("p.m", "pm")
+
+    # If it looks like "2am" or "2pm" (no minutes), insert :00
+    s = re.sub(r"^(\d{1,2})(am|pm)$", r"\1:00\2", s)
+
+    # If it looks like "2:30am" or "12:00pm" — already good
+
+    return s
+
+
+def _parse_target_time(time_str: str) -> datetime:
+    """
+    Parse a target time string into a datetime.
+
+    Supports:
+        - ISO format: 2026-07-25T14:30:00 or 2026-07-25 14:30
+        - Time only: 14:30, 2:30pm, 2;30am, 2.00pm, 2am, 12:00pm
+        - Common formats: 07/25/2026 14:30, 25-07-2026 14:30
+    """
+    original = time_str
+    time_str = _normalize_time_string(time_str)
+    now = datetime.now(timezone.utc)
+
+    # Try ISO format first
+    try:
+        return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+
+    # Try formats with date + time
+    formats = [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y %I:%M%p",
+        "%m/%d/%Y %I:%M %p",
+        "%d-%m-%Y %H:%M",
+        "%d/%m/%Y %H:%M",
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(time_str, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    # Try time-only formats (assume today, or tomorrow if passed)
+    # Try lowercase am/pm first
+    time_formats_lower = [
+        "%H:%M",
+        "%H:%M:%S",
+        "%I:%M%p",      # 12:00pm, 2:30pm
+        "%I:%M %p",     # 12:00 pm, 2:30 pm
+        "%I%p",         # 12pm, 2pm
+    ]
+    for fmt in time_formats_lower:
+        try:
+            dt = datetime.strptime(time_str, fmt)
+            dt = dt.replace(year=now.year, month=now.month, day=now.day, tzinfo=timezone.utc)
+            if dt < now:
+                dt += timedelta(days=1)
+            return dt
+        except ValueError:
+            pass
+
+    # Try uppercase AM/PM as fallback
+    time_str_upper = time_str.upper()
+    time_formats_upper = [
+        "%I:%M%p",      # 12:00PM
+        "%I:%M %p",     # 12:00 PM
+        "%I%p",         # 12PM
+    ]
+    for fmt in time_formats_upper:
+        try:
+            dt = datetime.strptime(time_str_upper, fmt)
+            dt = dt.replace(year=now.year, month=now.month, day=now.day, tzinfo=timezone.utc)
+            if dt < now:
+                dt += timedelta(days=1)
+            return dt
+        except ValueError:
+            pass
+
+    raise ValueError(f"Cannot parse time: '{original}' (normalized: '{time_str}')")
+
 
 def analyze_price_target(target_price: float, target_time_str: str) -> dict:
     """Analyze probability of hitting a price target by a given time."""
     data = fetch_live_data()
     current_price = data["price"]
 
-    # Parse target time
-    try:
-        target_time = datetime.fromisoformat(target_time_str.replace("Z", "+00:00"))
-    except ValueError:
-        # Try common formats
-        for fmt in ["%Y-%m-%d %H:%M", "%m/%d/%Y %H:%M", "%H:%M"]:
-            try:
-                target_time = datetime.strptime(target_time_str, fmt)
-                target_time = target_time.replace(tzinfo=timezone.utc)
-                if target_time < datetime.now(timezone.utc):
-                    target_time += timedelta(days=1)
-                break
-            except ValueError:
-                continue
-        else:
-            raise ValueError(f"Cannot parse time: {target_time_str}")
+    # Parse target time with robust handling
+    target_time = _parse_target_time(target_time_str)
 
     minutes_ahead = max(1, int((target_time - datetime.now(timezone.utc)).total_seconds() / 60))
 
