@@ -6,3 +6,10 @@ data/*.csv
 data/*.zip
 data/big_test.csv
 *.log
+
+# Prediction logs (large, auto-generated)
+reports/logs/*.jsonl
+
+# Generated reports
+reports/*.json
+reports/*.png
